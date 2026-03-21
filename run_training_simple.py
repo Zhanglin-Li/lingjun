@@ -41,6 +41,7 @@ DROPOUT_RATES_LINEAR = [0.2, 0.1]
 # 训练配置
 BATCH_SIZE = 16
 LR = 0.0005
+LR_ONLINE = 0.0003  # Online learning rate for validation
 EPOCHS_PER_SEED = {0: 8, 1: 8, 2: 8}  # 每个种子的 epochs
 SEED_RANGE = range(1)  # 训练的种子范围
 EARLY_STOPPING = True
@@ -154,61 +155,47 @@ def collate_fn(batches: list):
 # 训练函数
 # ============================================================
 
-def train_and_get_score(
-    model, train_dataloader, val_dataloader,
-    num_features, lr=0.001, early_stopping=True, early_stopping_patience=1,
-    checkpoint_interval=5, checkpoint_name="model",
-    epochs=None, verbose=True
-):
-    """训练模型并返回验证集 score
+def run_epoch(model, dataloader, criterion, device, optimizer=None,
+              scaler=None, use_aux_heads=True, online_lr=None, verbose=False):
+    """Run one epoch.
 
     Args:
-        num_features: 特征数量（用于日志）
+        optimizer: If provided, runs training mode with backward pass
+        use_aux_heads: Use auxiliary heads for multi-task learning
+        online_lr: If provided, do online learning update (single backward, no optimizer)
+
+    Returns:
+        tuple: (avg_loss, r2_score)
     """
-    device = next(model.parameters()).device
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    criterion = WeightedR2Loss()
-    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    is_training = optimizer is not None or online_lr is not None
+    model.train() if is_training else model.eval()
 
-    checkpoint_dir = "./checkpoints"
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    total_loss, n_batches = 0.0, 0
+    ss_res, ss_tot = 0.0, 0.0  # For incremental R2 computation
+    iterator = tqdm(dataloader) if verbose else dataloader
 
-    if verbose:
-        print(f"Device: {device}")
-        print(f"{'Epoch':^5} | {'Train Loss':^10} | {'Val Loss':^8} | {'Train R2':^9} | {'Val R2':^7} | {'LR':^7}")
-        print("-" * 60)
+    for x_batch, y_batch in iterator:
+        x_batch = x_batch.to(device, non_blocking=True)
+        y_batch = y_batch.to(device, non_blocking=True)
 
-    min_val_r2, best_epoch, no_improvement, best_model_state = -np.inf, 0, 0, None
+        y_main = y_batch[:, :, 0]
+        weights = torch.ones_like(y_main)
 
-    # 训练循环
-    for epoch in range(epochs):
-        # === train_one_epoch ===
-        model.train()
-        total_loss = 0.0
-        y_total, weights_total, preds_total = [], [], []
-        itr = tqdm(train_dataloader) if verbose else train_dataloader
+        context = torch.no_grad() if not is_training else torch.amp.autocast('cuda')
 
-        for x_batch, y_batch in itr:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+        with context:
+            preds, out_resp, _ = model(x_batch, None, use_aux_heads=use_aux_heads)
 
-            # 从 y_batch 拆分标签：主任务 + 辅助任务
-            y_main = y_batch[:, :, 0]           # LabelA
-            resp_batch = y_batch[:, :, 1:]      # LabelB, LabelC
-            weights_batch = torch.ones_like(y_main).to(device)
+            # Compute loss
+            loss = criterion(preds.flatten(), y_main.flatten(), weights.flatten())
+            if use_aux_heads and out_resp is not None:
+                resp = y_batch[:, :, 1:]
+                loss += criterion(out_resp[:, :, 0].flatten(), resp[:, :, 0].flatten(), weights.flatten())
+                loss += criterion(out_resp[:, :, 1].flatten(), resp[:, :, 1].flatten(), weights.flatten())
 
+        # Training update
+        if optimizer is not None:
             optimizer.zero_grad()
-
-            with torch.amp.autocast('cuda'):
-                out_y, out_resp, _ = model(x_batch, None, use_aux_heads=True)
-                loss1 = criterion(out_y.flatten(), y_main.flatten(), weights_batch.flatten())
-                if out_resp is not None:
-                    loss2 = criterion(out_resp[:, :, 0].flatten(), resp_batch[:, :, 0].flatten(), weights_batch.flatten())
-                    loss3 = criterion(out_resp[:, :, 1].flatten(), resp_batch[:, :, 1].flatten(), weights_batch.flatten())
-                    loss = loss1 + loss2 + loss3
-                else:
-                    loss = loss1
-
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -220,65 +207,87 @@ def train_and_get_score(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-            total_loss += loss.item()
-            y_total.append(y_main.flatten())
-            weights_total.append(weights_batch.flatten())
-            preds_total.append(out_y.detach().flatten())
+        # Online learning update (validation with single backward, LabelA only)
+        elif online_lr is not None:
+            # Create temporary optimizer for single update
+            for param in model.parameters():
+                param.grad = None
+            loss.backward()
+            with torch.no_grad():
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param -= online_lr * param.grad
 
-        y_total = torch.cat(y_total).cpu()
-        weights_total = torch.cat(weights_total).cpu()
-        preds_total = torch.cat(preds_total).cpu()
-        train_r2 = r2_weighted_torch(y_total, preds_total, weights_total).item()
-        train_loss = total_loss / len(train_dataloader)
+        total_loss += loss.item()
+        n_batches += 1
 
-        # Clear training tensors
-        del y_total, weights_total, preds_total
+        # Incremental R2 computation
+        with torch.no_grad():
+            ss_res += ((preds - y_main) ** 2).sum().item()
+            ss_tot += (y_main ** 2).sum().item()
 
-        # === validate_one_epoch ===
-        model.eval()
-        losses, all_y, all_weights, all_preds = [], [], [], []
-        itr_val = tqdm(val_dataloader) if verbose else val_dataloader
+    avg_loss = total_loss / n_batches
+    r2 = 1 - ss_res / (ss_tot + 1e-38)
 
-        for x_batch, y_batch in itr_val:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+    return avg_loss, r2
 
-            y_main = y_batch[:, :, 0]
-            weights_batch = torch.ones_like(y_main).to(device)
 
-            with torch.no_grad(), torch.amp.autocast('cuda'):
-                preds_batch, _, _ = model(x_batch, None, use_aux_heads=False)
-                loss = criterion(preds_batch.flatten(), y_main.flatten(), weights_batch.flatten())
+def train_and_get_score(
+    model, train_dataloader, val_dataloader,
+    lr=0.001, early_stopping=True, early_stopping_patience=1,
+    checkpoint_interval=5, checkpoint_name="model",
+    epochs=None, verbose=True, online_learning=False
+):
+    """训练模型并返回验证集 score.
 
-            losses.append(loss.item())
-            all_y.append(y_main.flatten())
-            all_weights.append(weights_batch.flatten())
-            all_preds.append(preds_batch.flatten())
+    Args:
+        online_learning: If True, update model during validation with LR_ONLINE
+    """
+    device = next(model.parameters()).device
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    criterion = WeightedR2Loss()
+    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
-        all_y = torch.cat(all_y)
-        all_weights = torch.cat(all_weights)
-        all_preds = torch.cat(all_preds)
-        val_loss = np.mean(losses)
-        val_r2 = r2_weighted_torch(all_y, all_preds, all_weights).item()
+    checkpoint_dir = "./checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # Clear validation tensors and switch back to train mode
-        del all_y, all_weights, all_preds, losses
-        model.train()
+    if verbose:
+        print(f"Device: {device}")
+        header = f"{'Epoch':^5} | {'Train Loss':^10} | {'Val Loss':^8} | {'Train R2':^9} | {'Val R2':^7}"
+        if online_learning:
+            header += f" | {'Online':^7}"
+        print(header)
+        print("-" * (67 if online_learning else 57))
 
-        lr_last = optimizer.param_groups[0]["lr"]
+    min_val_r2, best_epoch, no_improvement, best_model_state = -np.inf, 0, 0, None
+    online_lr = LR_ONLINE if online_learning else None
+
+    for epoch in range(epochs):
+        # Train epoch
+        train_loss, train_r2 = run_epoch(
+            model, train_dataloader, criterion, device,
+            optimizer=optimizer, scaler=scaler, use_aux_heads=True, verbose=verbose
+        )
+
+        # Validation epoch (with optional online learning)
+        val_loss, val_r2 = run_epoch(
+            model, val_dataloader, criterion, device,
+            use_aux_heads=False, online_lr=online_lr, verbose=verbose
+        )
+
         if verbose:
-            print(f"{epoch+1:^5} | {train_loss:^10.4f} | {val_loss:^8.4f} | {train_r2:^9.4f} | {val_r2:^7.4f} | {lr_last:^7.5f}")
+            msg = f"{epoch+1:^5} | {train_loss:^10.4f} | {val_loss:^8.4f} | {train_r2:^9.4f} | {val_r2:^7.4f}"
+            if online_learning:
+                msg += f" | {'✓':^7}"
+            print(msg)
 
+        # Early stopping & checkpointing
         if val_r2 > min_val_r2:
             min_val_r2, best_model_state, no_improvement, best_epoch = val_r2, model.state_dict(), 0, epoch
             if (epoch + 1) % checkpoint_interval == 0:
-                checkpoint_path = f"{checkpoint_dir}/checkpoint_{checkpoint_name}_epoch{epoch+1}.pt"
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': best_model_state,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_r2': min_val_r2
-                }, checkpoint_path)
+                path = f"{checkpoint_dir}/checkpoint_{checkpoint_name}_epoch{epoch+1}.pt"
+                torch.save({'epoch': epoch+1, 'model_state_dict': best_model_state,
+                           'optimizer_state_dict': optimizer.state_dict(), 'val_r2': min_val_r2}, path)
                 if verbose:
                     print(f"  [Checkpoint] Saved at epoch {epoch+1} (Val R2: {min_val_r2:.4f})")
         else:
@@ -286,7 +295,7 @@ def train_and_get_score(
 
         if early_stopping and no_improvement >= early_stopping_patience + 1:
             if verbose:
-                print(f"Early stopping on epoch {best_epoch+1}. Best score: {min_val_r2:.4f}")
+                print(f"Early stopping at epoch {best_epoch+1}. Best: {min_val_r2:.4f}")
             break
 
     if early_stopping and best_model_state is not None:
@@ -397,14 +406,14 @@ def main():
         # 训练
         score = train_and_get_score(
             model, train_dataloader, val_dataloader,
-            num_features=len(features),
             lr=LR,
             early_stopping=EARLY_STOPPING,
             early_stopping_patience=EARLY_STOPPING_PATIENCE,
             checkpoint_interval=CHECKPOINT_INTERVAL,
             checkpoint_name=f"{MODEL_TYPE}_{HIDDEN_SIZES[0]}_seed{seed}",
             epochs=epochs,
-            verbose=True
+            verbose=True,
+            online_learning=False  # Set True to enable online learning during validation
         )
         print(f"\nScore: {score:.5f}")
 
