@@ -138,3 +138,9 @@ X = X.reshape(T, -1, K).swapaxes(0, 1)  # For batch-first RNN
 ```python
 r2 = 1 - sum(w * (pred - true) ** 2) / (sum(w * true ** 2) + 1e-38)
 ```
+
+## Bash Command Style
+
+- Put comments/explanations AFTER the command, not inside quoted strings
+- Avoid `#` inside `-c "..."` Python strings - explain in response text instead
+- This prevents permission approval prompts
