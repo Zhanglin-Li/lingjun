@@ -7,6 +7,7 @@ import csv
 import gc
 import os
 import random
+import copy
 from datetime import datetime
 
 import numpy as np
@@ -466,12 +467,22 @@ def train_and_get_score(
             verbose=verbose, data_on_gpu=data_on_gpu
         )
 
-        # Validation epoch (with optional online learning)
-        val_loss, val_r2 = run_epoch(
-            model, val_dataloader, criterion, device,
-            use_aux_heads=False, online_lr=online_lr,
-            verbose=verbose, data_on_gpu=data_on_gpu
-        )
+        # Validation epoch (with optional online learning on a COPY of the model)
+        # Follow Jane Street approach: deepcopy model before online learning updates
+        # to prevent validation updates from affecting subsequent training
+        if online_lr is not None:
+            model_val = copy.deepcopy(model)
+            val_loss, val_r2 = run_epoch(
+                model_val, val_dataloader, criterion, device,
+                use_aux_heads=False, online_lr=online_lr,
+                verbose=verbose, data_on_gpu=data_on_gpu
+            )
+        else:
+            val_loss, val_r2 = run_epoch(
+                model, val_dataloader, criterion, device,
+                use_aux_heads=False,
+                verbose=verbose, data_on_gpu=data_on_gpu
+            )
 
         # 更新最终 epoch 的指标
         final_train_loss, final_val_loss = train_loss, val_loss
