@@ -1,72 +1,182 @@
 #!/usr/bin/env python3
 """简化版训练脚本 - 只依赖基础包 (polars/numpy/tqdm/torch)
 
-所有配置硬编码在脚本顶部，不依赖外部配置文件。
+配置从 config.yaml 读取。
 """
+import csv
 import gc
 import os
+import random
+from datetime import datetime
+
 import numpy as np
 import polars as pl
 import polars.selectors as cs
 import torch
-from torch.utils.data import DataLoader, Dataset
+import yaml
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 from tqdm.auto import tqdm
 
 from model import ModelR, WeightedR2Loss, r2_weighted_torch
 
 
+def set_seed(seed: int):
+    """固定所有随机性来源，确保可复现"""
+    # Python 内置 random
+    random.seed(seed)
+
+    # NumPy
+    np.random.seed(seed)
+
+    # PyTorch CPU
+    torch.manual_seed(seed)
+
+    # PyTorch CUDA
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def worker_init_fn(worker_id: int):
+    """DataLoader worker 进程的随机种子初始化"""
+    worker_info = get_worker_info()
+    if worker_info is not None:
+        seed = worker_info.seed  # PyTorch 自动传递的种子
+        np.random.seed(seed)
+        random.seed(seed)
+
+
 # ============================================================
-# 配置部分（硬编码，不依赖 config.yaml）
+# 实验日志记录
 # ============================================================
+
+class ExperimentLogger:
+    """实验日志记录器，记录超参和训练结果到 CSV 文件
+
+    CSV 文件同时作为 checkpoint 代号的映射表。
+    checkpoint 命名格式: exp_{id:03d}.pt
+    """
+
+    LOG_FILE = "experiments/experiment_log.csv"
+    FIELDS = [
+        "exp_id", "timestamp", "model_type", "hidden_sizes", "dropout_rates",
+        "hidden_sizes_linear", "dropout_rates_linear", "lr", "batch_size",
+        "weight_decay", "early_stopping_patience", "num_features",
+        "best_epoch", "best_val_r2", "final_train_loss", "final_val_loss",
+        "total_epochs", "ckpt_path", "notes"
+    ]
+
+    def __init__(self):
+        os.makedirs(os.path.dirname(self.LOG_FILE), exist_ok=True)
+        if not os.path.exists(self.LOG_FILE):
+            with open(self.LOG_FILE, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.FIELDS)
+
+    def get_next_id(self) -> int:
+        """获取下一个实验 ID"""
+        if not os.path.exists(self.LOG_FILE):
+            return 1
+        with open(self.LOG_FILE, "r") as f:
+            lines = f.readlines()
+            return len(lines)  # 行数 = id (header 不算)
+
+    def log(self, exp_id: int, config: dict, results: dict, ckpt_path: str = "", notes: str = ""):
+        """记录一次实验
+
+        Args:
+            exp_id: 实验代号
+            config: 包含超参的字典
+            results: 包含训练结果的字典
+            ckpt_path: checkpoint 文件路径
+            notes: 备注信息
+        """
+        row = {
+            "exp_id": exp_id,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "model_type": config.get("model_type", ""),
+            "hidden_sizes": str(config.get("hidden_sizes", [])),
+            "dropout_rates": str(config.get("dropout_rates", [])),
+            "hidden_sizes_linear": str(config.get("hidden_sizes_linear", [])),
+            "dropout_rates_linear": str(config.get("dropout_rates_linear", [])),
+            "lr": config.get("lr", 0),
+            "batch_size": config.get("batch_size", 0),
+            "weight_decay": config.get("weight_decay", 0.01),
+            "early_stopping_patience": config.get("early_stopping_patience", 0),
+            "num_features": config.get("num_features", 0),
+            "best_epoch": results.get("best_epoch", 0),
+            "best_val_r2": f"{results.get('best_val_r2', 0):.6f}",
+            "final_train_loss": f"{results.get('final_train_loss', 0):.4f}",
+            "final_val_loss": f"{results.get('final_val_loss', 0):.4f}",
+            "total_epochs": results.get("total_epochs", 0),
+            "ckpt_path": ckpt_path,
+            "notes": notes,
+        }
+
+        with open(self.LOG_FILE, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.FIELDS)
+            writer.writerow(row)
+
+        print(f"📊 实验已记录: exp_{exp_id:03d}")
+
+
+# ============================================================
+# 配置部分（从 config.yaml 读取）
+# ============================================================
+
+def load_config(config_path: str = "config.yaml") -> dict:
+    """从 YAML 文件加载配置"""
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+# 支持通过环境变量指定配置文件路径
+import sys
+_config_path = os.environ.get("CONFIG_PATH", "config.yaml")
+if len(sys.argv) > 1:
+    _config_path = sys.argv[1]
+
+# 加载配置
+_config = load_config(_config_path)
+print(f"📄 使用配置文件: {_config_path}")
 
 # 数据路径
-PATH_DATA = "./data"
-PATH_PARQUET = os.path.join(PATH_DATA, "train.parquet")
+PATH_PARQUET = _config["data"]["path_parquet"]
 
 # 列名配置
-COL_TARGET = "LabelA"
-COL_ID = "stockid"
-COL_DATE = "dateid"
-COL_TIME = "timeid"
-COL_WEIGHT = None  # 你的数据没有 weight 列
-COLS_RESPONDERS = ["LabelB", "LabelC"]
+COL_TARGET = _config["data"]["col_target"]
+COL_ID = _config["data"]["col_id"]
+COL_DATE = _config["data"]["col_date"]
+COL_TIME = _config["data"]["col_time"]
+COL_WEIGHT = _config["data"]["col_weight"]
+COLS_RESPONDERS = _config["data"]["cols_responders"]
 
 # 模型配置
-MODEL_TYPE = "gru"
-HIDDEN_SIZES = [500]
-DROPOUT_RATES = [0.3, 0.0, 0.0]
-HIDDEN_SIZES_LINEAR = [500, 300]
-DROPOUT_RATES_LINEAR = [0.2, 0.1]
+MODEL_TYPE = _config["model"]["type"]
+HIDDEN_SIZES = _config["model"]["hidden_sizes"]
+DROPOUT_RATES = _config["model"]["dropout_rates"]
+HIDDEN_SIZES_LINEAR = _config["model"]["hidden_sizes_linear"]
+DROPOUT_RATES_LINEAR = _config["model"]["dropout_rates_linear"]
 
 # 训练配置
-BATCH_SIZE = 16
-LR = 0.0005
-LR_ONLINE = 0.0003  # Online learning rate for validation
-EPOCHS_PER_SEED = {0: 8, 1: 8, 2: 8}  # 每个种子的 epochs
-SEED_RANGE = range(1)  # 训练的种子范围
-EARLY_STOPPING = True
-EARLY_STOPPING_PATIENCE = 1
-CHECKPOINT_INTERVAL = 5
+BATCH_SIZE = _config["training"]["batch_size"]
+LR = _config["training"]["lr"]
+LR_ONLINE = _config["training"]["lr_online"]
+EPOCHS_PER_SEED = {int(k): v for k, v in _config["training"]["epochs_per_seed"].items()}
+SEED_RANGE = range(max(EPOCHS_PER_SEED.keys()) + 1)
+EARLY_STOPPING = _config["training"]["early_stopping"]
+EARLY_STOPPING_PATIENCE = _config["training"]["early_stopping_patience"]
+CHECKPOINT_INTERVAL = _config["training"]["checkpoint_interval"]
+ONLINE_LEARNING = _config["training"]["online_learning"]
 
 # 数据划分
-TRAIN_DAYS = 288  # 训练集天数
-VALID_DAYS = 72   # 验证集天数
+TRAIN_DAYS = _config["split"]["train_days"]
+VALID_DAYS = _config["split"]["valid_days"]
 TOTAL_DAYS = TRAIN_DAYS + VALID_DAYS
 
-# 特征配置（与 data_processor.py 保持一致）
-COLS_INIT = [f'f{i}' for i in [
-    298, 285, 356, 253, 171, 250, 144, 379, 51, 120, 261, 279, 53, 141, 56, 301,
-    148, 104, 20, 380, 63, 202, 241, 57, 342, 223, 116, 127, 366, 178, 115, 336,
-    182, 124, 9, 87, 229, 335, 338, 92, 23, 281, 69, 324, 131, 224, 201, 343, 151,
-    330, 181, 344, 257, 278, 352, 358, 138, 39, 226, 291, 212, 73, 145, 353, 123,
-    309, 45, 105, 373, 371, 29, 55, 350, 362, 180, 21, 205, 189, 378, 28, 31, 271,
-    282, 13, 302, 337, 361, 177, 155, 364, 59, 365, 132, 35, 383, 58, 106, 34, 89,
-    50, 93, 174, 52, 8, 331, 78, 72, 284, 348, 153, 230, 54, 237, 312, 300, 259,
-    208, 159, 70, 220, 7, 43, 222, 292, 192, 254, 67, 340, 255, 183, 4, 207, 218,
-    99, 283, 158, 187, 103, 36, 211
-]]
-COLS_CORR = COLS_INIT[:20]
-T_ROLLING = 239  # rolling 窗口大小
+# 特征配置
+COLS_INIT = _config["features"]["cols_init"]
+COLS_CORR = COLS_INIT[:len(COLS_INIT)//5]  # 1/5 features for rolling/cross-sectional stats
+T_ROLLING = _config["features"]["t_rolling"]
 
 
 # ============================================================
@@ -144,6 +254,74 @@ class SimpleDataset(Dataset):
         return X, y
 
 
+class GPUDataset(Dataset):
+    """GPU 常驻 Dataset - 所有数据预加载到 GPU，消除传输瓶颈。
+
+    适用场景：GPU 内存足够容纳全部数据时使用。
+    数据必须预先按 (dateid, stockid, timeid) 排序。
+    """
+
+    def __init__(self, df: pl.DataFrame, features: list, labels: list, device: torch.device):
+        self.features = features
+        self.labels = labels
+        self.device = device
+
+        # 获取日期列表
+        dateids = df['dateid'].unique().sort().to_list()
+        self.dateids = dateids
+        n_days = len(dateids)
+
+        # 预处理所有数据到 GPU
+        print(f"预加载 {n_days} 天数据到 GPU...")
+
+        # 先在 GPU 分配空间
+        n_stocks = 500  # 固定 500 stocks
+        n_times = 239   # 固定 239 times
+        self.X_gpu = torch.empty(n_days, n_stocks, n_times, len(features), device=device)
+        self.y_gpu = torch.empty(n_days, n_stocks, n_times, len(labels), device=device)
+
+        # 数据已排序，直接分批处理
+        chunk_size = 10  # 每次处理 10 天
+        for start in range(0, n_days, chunk_size):
+            end = min(start + chunk_size, n_days)
+            date_chunk = dateids[start:end]
+
+            # 用 range filter（数据已排序）
+            df_chunk = df.filter(
+                (pl.col('dateid') >= date_chunk[0]) & (pl.col('dateid') <= date_chunk[-1])
+            )
+            X_chunk = df_chunk.select(features).to_torch(dtype=pl.Float32)
+            X_chunk = X_chunk.reshape(len(date_chunk), n_stocks, n_times, -1)
+
+            y_chunk = df_chunk.select(labels).to_torch(dtype=pl.Float32)
+            y_chunk = y_chunk.reshape(len(date_chunk), n_stocks, n_times, -1)
+
+            # 移动到 GPU 并同步
+            self.X_gpu[start:end] = X_chunk.to(device)
+            self.y_gpu[start:end] = y_chunk.to(device)
+            torch.cuda.synchronize()
+
+            # 清理 CPU 内存
+            del X_chunk, y_chunk, df_chunk
+            import gc
+            gc.collect()
+
+            print(f"  已加载 {end}/{n_days} 天...")
+
+        # 记录实际形状
+        self.n_stocks = n_stocks
+        self.n_times = n_times
+
+        print(f"GPU 数据加载完成: X {self.X_gpu.shape}, y {self.y_gpu.shape}")
+
+    def __len__(self):
+        return len(self.dateids)
+
+    def __getitem__(self, idx):
+        # 直接从 GPU tensor 切片，无传输开销
+        return self.X_gpu[idx], self.y_gpu[idx]
+
+
 def collate_fn(batches: list):
     """简单的拼接函数，将多个 batch 沿 batch 维度拼接"""
     X_batch = torch.cat([b[0] for b in batches], dim=0)
@@ -156,13 +334,15 @@ def collate_fn(batches: list):
 # ============================================================
 
 def run_epoch(model, dataloader, criterion, device, optimizer=None,
-              scaler=None, use_aux_heads=True, online_lr=None, verbose=False):
+              scaler=None, use_aux_heads=True, online_lr=None, verbose=False,
+              data_on_gpu=False):
     """Run one epoch.
 
     Args:
         optimizer: If provided, runs training mode with backward pass
         use_aux_heads: Use auxiliary heads for multi-task learning
         online_lr: If provided, do online learning update (single backward, no optimizer)
+        data_on_gpu: If True, data is already on GPU (skip .to(device))
 
     Returns:
         tuple: (avg_loss, r2_score)
@@ -171,12 +351,15 @@ def run_epoch(model, dataloader, criterion, device, optimizer=None,
     model.train() if is_training else model.eval()
 
     total_loss, n_batches = 0.0, 0
-    ss_res, ss_tot = 0.0, 0.0  # For incremental R2 computation
+    ss_res = 0.0  # Σ(y_pred - y_true)²
+    all_y = []  # 收集所有 y_true 用于计算均值
     iterator = tqdm(dataloader) if verbose else dataloader
 
     for x_batch, y_batch in iterator:
-        x_batch = x_batch.to(device, non_blocking=True)
-        y_batch = y_batch.to(device, non_blocking=True)
+        # 数据已在 GPU 时跳过传输
+        if not data_on_gpu:
+            x_batch = x_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
 
         y_main = y_batch[:, :, 0]
         weights = torch.ones_like(y_main)
@@ -207,26 +390,29 @@ def run_epoch(model, dataloader, criterion, device, optimizer=None,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-        # Online learning update (validation with single backward, LabelA only)
+        # Online learning update (validation with AdamW, LabelA only)
+        # Follows JS approach: single forward/backward with AdamW + grad clipping
         elif online_lr is not None:
-            # Create temporary optimizer for single update
-            for param in model.parameters():
-                param.grad = None
+            online_optimizer = torch.optim.AdamW(model.parameters(), lr=online_lr, weight_decay=0.01)
+            online_optimizer.zero_grad()
             loss.backward()
-            with torch.no_grad():
-                for param in model.parameters():
-                    if param.grad is not None:
-                        param -= online_lr * param.grad
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            online_optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
 
-        # Incremental R2 computation
+        # 收集预测和真实值用于 R² 计算
         with torch.no_grad():
             ss_res += ((preds - y_main) ** 2).sum().item()
-            ss_tot += (y_main ** 2).sum().item()
+            all_y.append(y_main.detach().cpu())
 
     avg_loss = total_loss / n_batches
+
+    # 计算标准 R²: 1 - Σ(y_pred - y_true)² / Σ(y_true - y_mean)²
+    all_y_cat = torch.cat(all_y)
+    y_mean = all_y_cat.mean().item()
+    ss_tot = ((all_y_cat - y_mean) ** 2).sum().item()
     r2 = 1 - ss_res / (ss_tot + 1e-38)
 
     return avg_loss, r2
@@ -235,13 +421,19 @@ def run_epoch(model, dataloader, criterion, device, optimizer=None,
 def train_and_get_score(
     model, train_dataloader, val_dataloader,
     lr=0.001, early_stopping=True, early_stopping_patience=1,
-    checkpoint_interval=5, checkpoint_name="model",
-    epochs=None, verbose=True, online_learning=False
+    exp_id=0,
+    epochs=None, verbose=True, online_learning=False, data_on_gpu=False
 ):
     """训练模型并返回验证集 score.
 
     Args:
         online_learning: If True, update model during validation with LR_ONLINE
+        data_on_gpu: If True, data is already on GPU (skip .to(device))
+        exp_id: 实验代号，用于 checkpoint 命名
+
+    Returns:
+        dict: 包含 best_val_r2, best_epoch, total_epochs, final_train_loss, final_val_loss,
+              ckpt_path (checkpoint 路径)
     """
     device = next(model.parameters()).device
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -260,20 +452,29 @@ def train_and_get_score(
         print("-" * (67 if online_learning else 57))
 
     min_val_r2, best_epoch, no_improvement, best_model_state = -np.inf, 0, 0, None
+    ckpt_path = None
     online_lr = LR_ONLINE if online_learning else None
+
+    # 用于记录最终 epoch 的指标
+    final_train_loss, final_val_loss = 0.0, 0.0
 
     for epoch in range(epochs):
         # Train epoch
         train_loss, train_r2 = run_epoch(
             model, train_dataloader, criterion, device,
-            optimizer=optimizer, scaler=scaler, use_aux_heads=True, verbose=verbose
+            optimizer=optimizer, scaler=scaler, use_aux_heads=True,
+            verbose=verbose, data_on_gpu=data_on_gpu
         )
 
         # Validation epoch (with optional online learning)
         val_loss, val_r2 = run_epoch(
             model, val_dataloader, criterion, device,
-            use_aux_heads=False, online_lr=online_lr, verbose=verbose
+            use_aux_heads=False, online_lr=online_lr,
+            verbose=verbose, data_on_gpu=data_on_gpu
         )
+
+        # 更新最终 epoch 的指标
+        final_train_loss, final_val_loss = train_loss, val_loss
 
         if verbose:
             msg = f"{epoch+1:^5} | {train_loss:^10.4f} | {val_loss:^8.4f} | {train_r2:^9.4f} | {val_r2:^7.4f}"
@@ -283,13 +484,24 @@ def train_and_get_score(
 
         # Early stopping & checkpointing
         if val_r2 > min_val_r2:
-            min_val_r2, best_model_state, no_improvement, best_epoch = val_r2, model.state_dict(), 0, epoch
-            if (epoch + 1) % checkpoint_interval == 0:
-                path = f"{checkpoint_dir}/checkpoint_{checkpoint_name}_epoch{epoch+1}.pt"
-                torch.save({'epoch': epoch+1, 'model_state_dict': best_model_state,
-                           'optimizer_state_dict': optimizer.state_dict(), 'val_r2': min_val_r2}, path)
+            # 删除旧的 best checkpoint
+            if ckpt_path is not None and os.path.exists(ckpt_path):
+                os.remove(ckpt_path)
                 if verbose:
-                    print(f"  [Checkpoint] Saved at epoch {epoch+1} (Val R2: {min_val_r2:.4f})")
+                    print(f"  [Clean] Removed old checkpoint: {ckpt_path}")
+
+            min_val_r2, best_model_state, no_improvement, best_epoch = val_r2, model.state_dict(), 0, epoch
+
+            # 保存最佳模型，使用 exp_id 命名
+            ckpt_path = f"{checkpoint_dir}/exp_{exp_id:03d}.pt"
+            torch.save({
+                'epoch': epoch+1,
+                'model_state_dict': best_model_state,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_r2': min_val_r2,
+            }, ckpt_path)
+            if verbose:
+                print(f"  [Best] Saved: {ckpt_path} (R²={min_val_r2:.6f})")
         else:
             no_improvement += 1
 
@@ -301,7 +513,14 @@ def train_and_get_score(
     if early_stopping and best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    return min_val_r2
+    return {
+        "best_val_r2": min_val_r2,
+        "best_epoch": best_epoch + 1,
+        "total_epochs": epoch + 1,
+        "final_train_loss": final_train_loss,
+        "final_val_loss": final_val_loss,
+        "ckpt_path": ckpt_path,
+    }
 
 
 # ============================================================
@@ -315,7 +534,7 @@ def main():
     print("=" * 60)
 
     # 配置 debug 模式
-    debug = True  # 设置为 True 使用少量数据测试
+    debug = False  # 设置为 False 使用完整数据
 
     # 构建特征列表
     suffixes = [f"_diff_rolling_avg_{T_ROLLING}", f"_rolling_std_{T_ROLLING}", "_avg_per_date_time"]
@@ -324,74 +543,111 @@ def main():
     # 标签列表：主任务 + 辅助任务
     labels = [COL_TARGET] + COLS_RESPONDERS  # [LabelA, LabelB, LabelC]
 
-    # 加载数据
-    print("\n加载数据...")
-    if debug:
-        print("[DEBUG] 使用少量数据进行测试...")
+    # 缓存文件路径（根据 debug 模式区分）
+    cache_dir = "./data/cache"
+    cache_file = f"{cache_dir}/train_standardized{'_debug' if debug else ''}.parquet"
+    os.makedirs(cache_dir, exist_ok=True)
 
-    df_lazy = pl.scan_parquet(PATH_PARQUET).sort('stockid', 'dateid', 'timeid')
-
-    if debug:
-        stockids = df_lazy.select('stockid').unique().collect().to_series().to_numpy()[:3]
-        dateids = df_lazy.select('dateid').unique().sort('dateid').collect().to_series().to_numpy()[:10]
-        df = df_lazy.filter(
-            pl.col('stockid').is_in(stockids.tolist()) &
-            pl.col('dateid').is_in(dateids.tolist())
-        ).collect()
-        train_days = 8  # Debug mode: 8 train + 2 validation
-        print(f"[DEBUG] 只加载 3 个 stock 前 10 天 (8 train + 2 val)")
-    else:
-        df = pl.read_parquet(PATH_PARQUET)
+    # 检查是否存在缓存文件
+    if os.path.exists(cache_file):
+        print(f"\n发现缓存文件: {cache_file}")
+        print("直接读取已标准化的数据...")
+        df = pl.read_parquet(cache_file)
         train_days = TRAIN_DAYS
+        print(f"数据：{df.shape}")
+    else:
+        # 加载数据
+        print("\n加载数据...")
+        if debug:
+            print("[DEBUG] 使用少量数据进行测试...")
 
-    # 添加特征
-    print("添加特征...")
-    df = add_features(df)
+        # 需要读取的列：特征列 + 元数据列 + 标签列
+        meta_cols = [COL_ID, COL_DATE, COL_TIME]
+        label_cols = [COL_TARGET] + COLS_RESPONDERS
+        select_cols = meta_cols + label_cols + COLS_INIT
 
-    # 标准化
-    print("标准化...")
-    feature_cols = [col for col in df.columns if col.startswith('f')]
+        df_lazy = pl.scan_parquet(PATH_PARQUET).select(select_cols).sort('stockid', 'dateid', 'timeid')
 
-    # 先填充 NaN 和 null（原始数据可能有 NaN）
-    df = df.with_columns([
-        pl.col(col).fill_nan(0.0).fill_null(0.0) for col in feature_cols
-    ])
+        if debug:
+            stockids = df_lazy.select('stockid').unique().collect().to_series().to_numpy()[:3]
+            dateids = df_lazy.select('dateid').unique().sort('dateid').collect().to_series().to_numpy()[:10]
+            df = df_lazy.filter(
+                pl.col('stockid').is_in(stockids.tolist()) &
+                pl.col('dateid').is_in(dateids.tolist())
+            ).collect()
+            train_days = 8  # Debug mode: 8 train + 2 validation
+            print(f"[DEBUG] 只加载 3 个 stock 前 10 天 (8 train + 2 val)")
+        else:
+            df = df_lazy.collect()
+            train_days = TRAIN_DAYS
 
-    # 再标准化
-    df = df.with_columns([
-        (pl.col(col) - pl.col(col).mean()) / (pl.col(col).std() + 1e-9)
-        for col in feature_cols
-    ])
+        # 添加特征
+        print("添加特征...")
+        df = add_features(df)
 
-    # 处理 rolling 产生的 NaN/null
-    df = df.with_columns([
-        pl.col(col).fill_nan(0.0).fill_null(0.0) for col in feature_cols
-    ])
+        # 标准化
+        print("标准化...")
+        feature_cols = [col for col in df.columns if col.startswith('f')]
 
-    print(f"数据：{df.shape}, 特征：{len(features)}")
+        # 先填充 NaN 和 null（原始数据可能有 NaN）
+        df = df.with_columns([
+            pl.col(col).fill_nan(0.0).fill_null(0.0) for col in feature_cols
+        ])
+
+        # 再标准化
+        df = df.with_columns([
+            (pl.col(col) - pl.col(col).mean()) / (pl.col(col).std() + 1e-9)
+            for col in feature_cols
+        ])
+
+        # 处理 rolling 产生的 NaN/null
+        df = df.with_columns([
+            pl.col(col).fill_nan(0.0).fill_null(0.0) for col in feature_cols
+        ])
+
+        # 保存缓存
+        print(f"保存缓存到: {cache_file}")
+        df.write_parquet(cache_file)
+        print(f"数据：{df.shape}, 特征：{len(features)}")
 
     for seed in SEED_RANGE:
         epochs = EPOCHS_PER_SEED.get(seed, 8)
 
-        # 设置随机种子
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        # 固定所有随机性来源
+        set_seed(seed)
 
-        # 数据划分
-        df_train = df.filter(pl.col(COL_DATE) < train_days)
-        df_valid = df.filter(pl.col(COL_DATE) >= train_days)
+        # 为 DataLoader 创建独立的随机生成器
+        g = torch.Generator()
+        g.manual_seed(seed)
 
-        # 创建 Dataset
-        train_dataset = SimpleDataset(df_train, features, labels)
-        val_dataset = SimpleDataset(df_valid, features, labels)
+        # 创建设备（GPUDataset 需要）
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-        val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+        # 预先排序（避免在 GPUDataset 中重复排序）
+        print("排序数据...")
+        df_sorted = df.sort('dateid', 'stockid', 'timeid')
+
+        # 数据划分（已排序）
+        df_train = df_sorted.filter(pl.col(COL_DATE) < train_days)
+        df_valid = df_sorted.filter(pl.col(COL_DATE) >= train_days)
+
+        # 创建 Dataset（使用 GPU 预加载版）
+        train_dataset = GPUDataset(df_train, features, labels, device)
+        val_dataset = GPUDataset(df_valid, features, labels, device)
+
+        train_dataloader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+            collate_fn=collate_fn,  # 不需要 pin_memory，数据已在 GPU
+            generator=g, worker_init_fn=worker_init_fn
+        )
+        val_dataloader = DataLoader(
+            val_dataset, batch_size=1, shuffle=False,
+            collate_fn=collate_fn
+        )
 
         print(f"\n训练集：{len(train_dataset)} 天，验证集：{len(val_dataset)} 天，特征数：{len(features)}")
 
         # 创建模型
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         model = ModelR(
             len(features),
             HIDDEN_SIZES,
@@ -403,22 +659,43 @@ def main():
 
         print(f"\n模型参数：{sum(p.numel() for p in model.parameters()):,}")
 
+        # 获取实验代号
+        logger = ExperimentLogger()
+        exp_id = logger.get_next_id()
+        print(f"实验代号: exp_{exp_id:03d}")
+
         # 训练
-        score = train_and_get_score(
+        results = train_and_get_score(
             model, train_dataloader, val_dataloader,
             lr=LR,
             early_stopping=EARLY_STOPPING,
             early_stopping_patience=EARLY_STOPPING_PATIENCE,
-            checkpoint_interval=CHECKPOINT_INTERVAL,
-            checkpoint_name=f"{MODEL_TYPE}_{HIDDEN_SIZES[0]}_seed{seed}",
+            exp_id=exp_id,
             epochs=epochs,
             verbose=True,
-            online_learning=False  # Set True to enable online learning during validation
+            online_learning=ONLINE_LEARNING,
+            data_on_gpu=True  # 数据已在 GPU
         )
-        print(f"\nScore: {score:.5f}")
+
+        # 记录实验
+        config = {
+            "model_type": MODEL_TYPE,
+            "hidden_sizes": HIDDEN_SIZES,
+            "dropout_rates": DROPOUT_RATES,
+            "hidden_sizes_linear": HIDDEN_SIZES_LINEAR,
+            "dropout_rates_linear": DROPOUT_RATES_LINEAR,
+            "lr": LR,
+            "batch_size": BATCH_SIZE,
+            "weight_decay": 0.01,
+            "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+            "num_features": len(features),
+        }
+        logger.log(exp_id, config, results, ckpt_path=results["ckpt_path"], notes=f"seed{seed}")
 
         # 清理当前 seed 的数据
         del train_dataset, val_dataset, train_dataloader, val_dataloader, model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
     print("\n✅ 完成!")

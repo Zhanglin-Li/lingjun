@@ -10,6 +10,8 @@ def r2_weighted_torch(
 ) -> torch.Tensor:
     """Compute the weighted R² score using PyTorch tensors.
 
+    R² = 1 - Σw(y_pred - y_true)² / Σw(y_true - y_mean)²
+
     Args:
         y_true (torch.Tensor): Ground truth tensor.
         y_pred (torch.Tensor): Predicted tensor.
@@ -20,14 +22,21 @@ def r2_weighted_torch(
     """
     if sample_weight is None:
         sample_weight = torch.ones_like(y_true)
+
+    # 加权均值
+    y_mean = torch.sum(sample_weight * y_true) / (torch.sum(sample_weight) + 1e-38)
+
     numerator = torch.sum(sample_weight * (y_pred - y_true) ** 2)
-    denominator = torch.sum(sample_weight * (y_true) ** 2) + 1e-38
+    denominator = torch.sum(sample_weight * (y_true - y_mean) ** 2) + 1e-38
     r2 = 1 - (numerator / denominator)
     return r2
 
 
 class WeightedR2Loss(nn.Module):
-    """PyTorch loss function for weighted R²."""
+    """PyTorch loss function for weighted R².
+
+    Loss = Σw(y_pred - y_true)² / Σw(y_true - y_mean)²
+    """
     def __init__(self, epsilon: float = 1e-38) -> None:
         super(WeightedR2Loss, self).__init__()
         self.epsilon = epsilon
@@ -50,8 +59,12 @@ class WeightedR2Loss(nn.Module):
         """
         if weights is None:
             weights = torch.ones_like(y_true)
+
+        # 加权均值
+        y_mean = torch.sum(weights * y_true) / (torch.sum(weights) + self.epsilon)
+
         numerator = torch.sum(weights * (y_pred - y_true) ** 2)
-        denominator = torch.sum(weights * (y_true) ** 2) + self.epsilon
+        denominator = torch.sum(weights * (y_true - y_mean) ** 2) + self.epsilon
         loss = numerator / denominator
         return loss
 

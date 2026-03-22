@@ -1,0 +1,123 @@
+data:
+  col_date: dateid
+  col_id: stockid
+  col_target: LabelA
+  col_time: timeid
+  col_weight: null
+  cols_responders:
+  - LabelB
+  - LabelC
+  path_parquet: data/filtered.parquet
+features:
+  cols_init:
+  - f298
+  - f285
+  - f356
+  - f253
+  - f171
+  - f250
+  - f144
+  - f379
+  - f51
+  - f120
+  - f261
+  - f279
+  - f53
+  - f141
+  - f56
+  - f301
+  - f148
+  - f104
+  - f20
+  - f380
+  - f63
+  - f202
+  - f241
+  - f57
+  - f342
+  - f223
+  - f116
+  - f127
+  - f366
+  - f178
+  - f115
+  - f336
+  - f182
+  - f124
+  - f9
+  - f87
+  - f229
+  - f335
+  - f338
+  - f92
+  - f23
+  - f281
+  - f69
+  - f324
+  - f131
+  - f224
+  - f201
+  - f343
+  - f151
+  - f330
+  - f181
+  - f344
+  - f257
+  - f278
+  - f352
+  - f358
+  - f138
+  - f39
+  - f226
+  - f291
+  - f212
+  - f73
+  - f145
+  - f353
+  - f123
+  - f309
+  - f45
+  - f105
+  - f373
+  - f371
+  - f29
+  - f55
+  - f350
+  - f362
+  - f180
+  - f21
+  - f205
+  - f189
+  - f378
+  - f28
+  t_rolling: 239
+model:
+  dropout_rates:
+  - 0.3
+  - 0.3
+  - 0.0
+  dropout_rates_linear:
+  - 0.2
+  - 0.1
+  hidden_sizes:
+  - 512
+  - 256
+  hidden_sizes_linear:
+  - 500
+  - 300
+  type: gru
+split:
+  train_days: 288
+  valid_days: 72
+training:
+  batch_size: 4
+  checkpoint_interval: 5
+  early_stopping: true
+  early_stopping_patience: 15
+  epochs_per_seed:
+    0: 1000
+  lr: 0.0001
+  lr_online: 0.00006
+  online_learning: false
+  seed_range:
+  - 0
