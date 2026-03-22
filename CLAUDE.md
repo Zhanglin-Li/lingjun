@@ -95,8 +95,9 @@ Default settings:
 
 - Input: `train.parquet` (~43M rows, 42GB)
 - GPU Memory for GPUDataset:
-  - 224 stocks (filtered.parquet): BS=4 safe on 32GB VRAM
-  - 500 stocks (train.parquet): BS=1 required, 22.7GB total data
+  - 224 stocks (filtered.parquet): BS=4, 80 features works
+  - 500 stocks (train.parquet): BS=1 required, 50 features for safety
+  - Feature count affects memory significantly (input tensor size)
 - Pre-sort data before GPUDataset to avoid Polars sort memory spike
 - Time steps: T=239 per sample
 - Train/Val split: 288/72 days
@@ -168,6 +169,17 @@ ss_tot = sum(w * (true - y_mean) ** 2)
 r2 = 1 - ss_res / (ss_tot + 1e-38)
 ```
 
+**Online learning validation (CRITICAL):**
+
+```python
+# When doing online learning during validation, MUST copy the model first
+# to avoid modifying the training model (follows Jane Street pattern)
+import copy
+if online_lr is not None:
+    model_val = copy.deepcopy(model)
+    # Run validation/updates on model_val, not model
+```
+
 ## Bash Command Style
 
 - Put comments/explanations AFTER the command, not inside quoted strings
@@ -193,6 +205,14 @@ Using `data/filtered.parquet` (exchangeid=0 subset):
 | 10 | [768] | 0.3 | 0.0001 | 4 | -0.0087 | 9 | Larger → overfit |
 | 11 | [512, 256] | 0.3 | 0.0001 | 4 | **+0.0102** | 57 | **Best!** |
 | 12 | [512, 256] | 0.1 | 0.0001 | 4 | **+0.0102** | 37 | Same good |
+
+### Completed Experiments (exp_016+)
+
+Using `data/train.parquet` (full dataset, 500 stocks):
+
+| ID | Features | BS | Best Val R² | Epoch | Notes |
+|----|----------|-----|-------------|-------|-------|
+| 16 | 50 | 1 | +0.0077 | 54 | Memory-optimized config |
 
 ### Planned Experiments (exp_014 - exp_019)
 
