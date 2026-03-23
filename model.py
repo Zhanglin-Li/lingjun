@@ -112,12 +112,12 @@ class ModelRBase(nn.Module):
 
 
 class ModelR(nn.Module):
-    """Recurrent model with auxiliary heads for multi-task learning.
+    """Recurrent model with multiple GRUs, output via single linear layer.
 
-    Architecture:
-    - Multiple GRU/LSTM layers for each responder
-    - Auxiliary heads for each responder (用于辅助任务)
-    - Main output head that concatenates GRU outputs
+    Simplified architecture:
+    - Multiple GRU/LSTM layers for each responder (shared feature extraction)
+    - Concatenate GRU outputs
+    - Single linear layer to produce main prediction
     """
     def __init__(self, input_size, hidden_sizes, dropout_rates, hidden_sizes_linear, dropout_rates_linear, model_type):
         super().__init__()
@@ -129,25 +129,10 @@ class ModelR(nn.Module):
         for _ in range(self.num_resp):
             self.grus.append(ModelRBase(input_size, hidden_sizes, dropout_rates, hidden_sizes_linear, dropout_rates_linear, model_type))
 
-        # Main output head
+        # Main output head: concat GRU outputs -> linear -> prediction
         self.main_out = nn.Linear(self.hidden_size * self.num_resp, 1)
 
-        # Auxiliary heads for each responder
-        self.aux_heads = nn.ModuleList()
-        for _ in range(self.num_resp):
-            aux_head = nn.Sequential()
-            if hidden_sizes_linear:
-                for i, h in enumerate(hidden_sizes_linear):
-                    in_feat = self.hidden_size if i == 0 else hidden_sizes_linear[i-1]
-                    aux_head.add_module(f'aux_fc_{i}', nn.Linear(in_feat, h))
-                    aux_head.add_module(f'aux_relu_{i}', nn.ReLU())
-                    aux_head.add_module(f'aux_drop_{i}', nn.Dropout(dropout_rates_linear[i]))
-                aux_head.add_module('aux_out', nn.Linear(hidden_sizes_linear[-1], 1))
-            else:
-                aux_head.add_module('aux_out', nn.Linear(self.hidden_size, 1))
-            self.aux_heads.append(aux_head)
-
-    def forward(self, x, hidden=None, use_aux_heads=True):
+    def forward(self, x, hidden=None):
         D, T, _ = x.shape
         if hidden is None:
             hidden = [None] * self.num_resp
@@ -159,17 +144,9 @@ class ModelR(nn.Module):
             gru_outputs.append(gru_out)
             new_hidden.append(h)
 
+        # Concatenate GRU outputs and apply linear layer
         concat_out = torch.cat(gru_outputs, dim=-1)
         concat_flat = concat_out.reshape(D * T, -1)
         main_pred = self.main_out(concat_flat).reshape(D, T)
 
-        aux_preds = None
-        if use_aux_heads:
-            aux_list = []
-            for i in range(self.num_resp):
-                gru_flat = gru_outputs[i].reshape(D * T, -1)
-                aux_pred = self.aux_heads[i](gru_flat).reshape(D, T, 1)
-                aux_list.append(aux_pred)
-            aux_preds = torch.cat(aux_list, dim=-1)
-
-        return main_pred, aux_preds, new_hidden
+        return main_pred, concat_out, new_hidden
