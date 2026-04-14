@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "jupyter": {
+      "command": "jupyter-mcp-server",
+      "args": [
+        "--jupyterlab", "false",
+        "--jupyter-url", "http://localhost:8888/jupyter",
+        "--jupyter-token", "jupyter-autodl-container-ab4341a2e0-0e2de444-e6581ff7706eb44528af95f4101762a354bf3c84b6feb43fd942bb72f29536103"
+      ]
+    }
+  }
+}

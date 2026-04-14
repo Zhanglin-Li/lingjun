@@ -1,12 +1,12 @@
 """PyTorch model definitions for simplified training script."""
 import torch
 import torch.nn as nn
-
+from typing import Optional
 
 def r2_weighted_torch(
     y_true: torch.Tensor,
     y_pred: torch.Tensor,
-    sample_weight: torch.Tensor = None
+    sample_weight: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Compute the weighted R² score using PyTorch tensors.
 
@@ -45,7 +45,7 @@ class WeightedR2Loss(nn.Module):
         self,
         y_pred: torch.Tensor,
         y_true: torch.Tensor,
-        weights: torch.Tensor = None
+        weights: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Compute the weighted R² loss.
 
@@ -97,6 +97,8 @@ class ModelRBase(nn.Module):
 
     def forward(self, x, hidden=None, return_raw=False):
         D, T, _ = x.shape
+        # Ensure input is float32 to avoid dtype mismatch with autocast/checkpoint
+        x = x.to(torch.float32)
         if hidden is None:
             hidden = [None] * self.num_layers
         for i, gru in enumerate(self.gru_layers):
@@ -118,11 +120,16 @@ class ModelR(nn.Module):
     - Multiple GRU/LSTM layers for each responder (shared feature extraction)
     - Concatenate GRU outputs
     - Single linear layer to produce main prediction
+    - Auxiliary heads for multi-task learning (optional, controlled by `use_aux_targets`)
+
+    Args:
+        use_aux_targets: Whether to use auxiliary heads for LabelB/LabelC. Default: False.
     """
-    def __init__(self, input_size, hidden_sizes, dropout_rates, hidden_sizes_linear, dropout_rates_linear, model_type):
+    def __init__(self, input_size, hidden_sizes, dropout_rates, hidden_sizes_linear, dropout_rates_linear, model_type, use_aux_targets=False):
         super().__init__()
         self.num_resp = 2  # 处理 2 个 responders
         self.hidden_size = hidden_sizes[-1] if hidden_sizes else input_size
+        self.use_aux_targets = use_aux_targets
 
         # GRU layers for each responder
         self.grus = nn.ModuleList()
@@ -132,7 +139,26 @@ class ModelR(nn.Module):
         # Main output head: concat GRU outputs -> linear -> prediction
         self.main_out = nn.Linear(self.hidden_size * self.num_resp, 1)
 
-    def forward(self, x, hidden=None):
+        # Auxiliary heads for LabelB and LabelC (multi-task learning, optional)
+        if self.use_aux_targets:
+            self.aux_heads = nn.ModuleList([
+                nn.Linear(self.hidden_size, 1) for _ in range(self.num_resp)
+            ])
+        else:
+            self.aux_heads = None
+
+    def forward(self, x, labels=None, hidden=None):
+        """Forward pass.
+
+        Args:
+            x: Input tensor, shape (D, T, F) where D=batch*stocks, T=239, F=features
+            labels: Labels tensor, shape (D, T, 3) for [LabelA, LabelB, LabelC], or (D, T) for LabelA only
+            hidden: Hidden states for GRU
+
+        Returns:
+            If labels is None: (main_pred, aux_out, hidden) — aux_out is None when use_aux_targets=False
+            If labels is not None: {"loss": loss, "logits": main_pred}
+        """
         D, T, _ = x.shape
         if hidden is None:
             hidden = [None] * self.num_resp
@@ -147,6 +173,39 @@ class ModelR(nn.Module):
         # Concatenate GRU outputs and apply linear layer
         concat_out = torch.cat(gru_outputs, dim=-1)
         concat_flat = concat_out.reshape(D * T, -1)
-        main_pred = self.main_out(concat_flat).reshape(D, T)
+        main_pred = self.main_out(concat_flat).reshape(D, T)  # (D, T) for LabelA
 
-        return main_pred, concat_out, new_hidden
+        # Auxiliary predictions (optional)
+        if self.use_aux_targets:
+            aux_preds = []
+            for i, gru_out in enumerate(gru_outputs):
+                aux_flat = gru_out.reshape(D * T, -1)
+                aux_pred = self.aux_heads[i](aux_flat).reshape(D, T)
+                aux_preds.append(aux_pred)
+            aux_out = torch.stack(aux_preds, dim=-1)  # (D, T, 2) for [LabelB, LabelC]
+        else:
+            aux_out = None
+
+        # Compute loss if labels provided (for HF Trainer)
+        if labels is not None:
+            loss_fn = WeightedR2Loss()
+
+            # labels shape: (D, T, 3) -> [LabelA, LabelB, LabelC]
+            label_a = labels[..., 0]  # (D, T)
+
+            # Main loss: LabelA
+            loss = loss_fn(main_pred, label_a)
+
+            # Auxiliary losses: LabelB, LabelC (only when use_aux_targets=True)
+            if self.use_aux_targets and aux_out is not None:
+                label_b = labels[..., 1]  # (D, T)
+                label_c = labels[..., 2]  # (D, T)
+                label_b_pred = aux_out[..., 0]  # (D, T)
+                label_c_pred = aux_out[..., 1]  # (D, T)
+                loss_b = loss_fn(label_b_pred, label_b)
+                loss_c = loss_fn(label_c_pred, label_c)
+                loss = loss + loss_b + loss_c
+
+            return {"loss": loss, "logits": main_pred}
+
+        return main_pred, aux_out, new_hidden

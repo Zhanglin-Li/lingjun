@@ -1,268 +1,128 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Configuration Modification Rule (CRITICAL)
+
+**配置文件参数（如 batch_size、lr、hidden_sizes 等）不能随意修改。**
+- 只有用户明确要求"改配置"时才能修改
+- 修改前必须先询问用户确认
+- 代码工程优化（如内存优化、并行处理）不需要询问
 
 ## Project Overview
 
 Lingjun China A-Share Market Microstructure Prediction competition. 500 stocks, 384 features (`f0`-`f383`), targets `LabelA` (main), `LabelB`/`LabelC` (auxiliary).
 
-## Documentation
-
-- `docs/lingjun_comp.md` - Competition description and rules
-- `docs/solution_lingjun.md` - Adapted solution approach for this competition
-- `docs/solution_jane_street.md` - Original Jane Street solution (reference)
-- `docs/exchange_analysis.md` - Analysis of exchangeid=0 vs exchangeid=1 data differences
-- `kagglejanestreet/` - JS original source code (reference for online learning, model architecture)
-
-## Environment & Commands
-
-```bash
-# Activate virtual environment
-source .venv/bin/activate
-
-# Install dependencies (uv recommended)
-uv sync
-
-# Run training
-python run_training_simple.py config/config.yaml  # Pass config as argument
-# Or via environment: CONFIG_PATH=config/config.yaml python run_training_simple.py
-
-# Syntax check
-python -m py_compile run_training_simple.py
-```
-
-## Code Architecture
-
-### Directory Structure
-
-```
-├── config/                  # Configuration files
-│   ├── config.yaml          # Default config (best: exp_012)
-│   ├── config_exp_014.yaml  # GRU [512, 256] 2层递减
-│   ├── config_exp_015.yaml  # GRU [512, 512] 2层非递减
-│   ├── config_exp_016.yaml  # GRU [512, 256, 128] 3层递减
-│   ├── config_exp_017.yaml  # GRU [512, 512, 512] 3层非递减
-│   ├── config_exp_018.yaml  # GRU [768, 384, 192] 3层增大+递减
-│   └── config_exp_019.yaml  # LSTM [512, 256]
-├── custom_dataset.py        # CustomDataset (lazy loading with Polars)
-├── model.py                 # ModelR, WeightedR2Loss, r2_weighted_torch
-├── run_training_simple.py   # Main training script (YAML config)
-├── pyproject.toml
-├── data/                    # train.parquet, test.parquet
-├── experiments/             # experiment_log.csv
-└── checkpoints/             # exp_XXX.pt
-```
-
-### Key Components
-
-**Data Flow:**
-
-1. Load `train.parquet` → Add rolling features → Standardize → Fill NaN
-2. `GPUDataset` (in run_training_simple.py) - Preloads data to GPU, wraps DataFrame by dateid
-3. Features: 140 selected features + rolling stats + cross-sectional means
-
-**Model Architecture (`model.py`):**
-
-- `ModelRBase`: GRU/LSTM layers + FC head
-- `ModelR`: Dual-GRU with auxiliary heads for multi-task learning
-- `WeightedR2Loss`: Loss function for training
-
-**Training (`run_training_simple.py`):**
-
-- YAML config file (pass as argument: `python run_training_simple.py config/config_exp_014.yaml`)
-- exp_id auto-increments based on experiment_log.csv
-- Checkpoint naming: `exp_{id:03d}.pt`
-- Online learning: AdamW (lr=0.0003, weight_decay=0.01) + grad clipping (max_norm=1.0) per batch
-
-### Configuration
-
-Config files in `config/` folder. Run with:
-```bash
-python run_training_simple.py config/config_exp_014.yaml
-
-# When switching datasets (e.g., filtered.parquet → train.parquet), delete cache:
-rm -f ./data/cache/train_standardized.parquet
-```
-
-Default settings:
-- `path_parquet = "data/train.parquet"` (full dataset, ~43M rows)
-- `COL_TARGET = "LabelA"`, `COLS_RESPONDERS = ["LabelB", "LabelC"]`
-- `lr = 0.0001`, `lr_online = 0.00006`, `batch_size = 4`
-- `online_learning = true`
-- `early_stopping_patience = 10`
-
-### Data Specifications
-
-- Input: `train.parquet` (~43M rows, 42GB)
-- GPU Memory for GPUDataset:
-  - 224 stocks (filtered.parquet): BS=4, 80 features works
-  - 500 stocks (train.parquet): BS=1 required, 50 features for safety
-  - Feature count affects memory significantly (input tensor size)
-- Pre-sort data before GPUDataset to avoid Polars sort memory spike
-- Time steps: T=239 per sample
-- Train/Val split: 288/72 days
-- Rolling window: 239 time steps
-
-### Exchange Analysis (IMPORTANT)
-
-**exchangeid=0 vs exchangeid=1 are TOTALLY DIFFERENT:**
-- **Different stocks**: 224 vs 276, zero overlap (each stock belongs to exactly ONE exchange)
-- **Different row counts**: 19.2M vs 23.7M
-- **ALL 384 features have DIFFERENT means** between exchanges
-- **NaN patterns differ**: Some features NaN in one exchange but not the other (e.g., f200 NaN only in exch 0)
-- **Stock IDs are interleaved** between exchanges (not sequential ranges)
-
-**Implications:**
-- Filter by `exchangeid=0` for primary training (or model exchanges separately)
-- Exchange-specific normalization may improve performance
-- Do NOT assume feature distributions are identical across exchanges
-- When analyzing data, use explicit per-exchange filtering (not `group_by().agg()`)
-
-### Competition Notes
-
-- Data partitioned by `stockid` (500 stocks: interleaved across exchanges)
-- Each stock belongs to exactly ONE exchange (no overlap)
+**Competition Notes:**
+- Data partitioned by `stockid` (500 stocks)
 - Submission format: `stockid|dateid|timeid,prediction`
 - Last 10 timeids (229-238) not scored but must be submitted
 - No forward-looking: only use current/earlier dateid+timeid data
 
-## Common Patterns
+## Documentation
 
-**NaN handling (CRITICAL):**
+详细项目文档（架构、数据流、特征工程、模型、训练、Online Learning 等）见 `docs/README.md`。
 
-```python
-# train.parquet has NaN in some features (e.g., f285)
-# Must use fill_nan() - fill_null() does NOT handle NaN
-df = df.with_columns([
-    pl.col(col).fill_nan(0.0).fill_null(0.0) for col in feature_cols
-])
-# After standardization, fill again (rolling stats produce NaN)
-df = df.with_columns([
-    pl.col(col).fill_nan(0.0).fill_null(0.0) for col in feature_cols
-])
+### Directory Layout
+
+- **`config/`** — baseline configs (template.yaml, config.yaml)
+- **`config/<param>/`** — sweep configs per parameter (e.g. config/hidden_size/)
+- **`scripts/`** — all shell scripts (e.g. scripts/run_sweep.sh)
+
+## Environment & Commands
+
+```bash
+# Activate & install
+source .venv/bin/activate && uv sync
+
+# Run training
+.venv/bin/python train.py config/template.yaml    # default, takes config as first arg
+# Also: train.ipynb (HuggingFace Trainer, Jupyter notebook)
+# Also: bash scripts/run_sweep.sh (runs config/*.yaml sequentially with resume support)
+
+# Sweep configs: config/<param>/ directory per sweep (e.g. config/hidden_size/)
+# Scripts: scripts/ directory (e.g. scripts/run_sweep.sh)
+
+# Syntax check
+.venv/bin/python -m py_compile train.py
+
+# Clear cache (when switching datasets)
+rm -f ./data/cache/train_standardized.parquet
 ```
 
-**Feature engineering:**
+## Package Installation (CRITICAL)
 
-```python
-# Rolling statistics per stockid
-pl.col(col).rolling_mean(239).over('stockid')
-pl.col(col).rolling_std(239).over('stockid')
-# Cross-sectional mean per datetime
-pl.col(col).mean().over('dateid', 'timeid')
+**必须使用 uv，禁止 pip install！禁止使用国外官网源！**
+
+```bash
+# 安装新包（默认使用阿里云镜像，已在 pyproject.toml 配置）
+source .venv/bin/activate && uv add <package>
+
+# 国内镜像源（默认生效，无需额外指定）
+# 阿里云: http://mirrors.aliyun.com/pypi/simple（pyproject.toml 已配置为默认）
+# 清华: https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 仅作为备选：uv pip install（用于版本冲突时）
+source .venv/bin/activate && uv pip install <package>
 ```
 
-**Tensor reshaping for RNN:**
+**禁止使用：**
+- `pip install` - 会绕过 uv lock，导致依赖混乱
+- 国外官网源（如 https://download.pytorch.org/whl）- 国内无法连接或极慢
+
+## Training Patterns
+
+- **Primary training**: `train.py` (HuggingFace Trainer, Python script) — takes config path as first arg
+- **Notebook**: `train.ipynb` — same HF Trainer setup, uses `config/template.yaml`
+- **Sweep automation**: `scripts/run_sweep.sh` runs configs sequentially; checks `experiments/experiment_log.csv` line count to skip completed runs; interrupted sweeps resume by re-running
+- **Config format**: OmegaConf, needs `data.n_features`, `model.{hidden_sizes,dropout_rates,hidden_sizes_linear,dropout_rates_linear,type}`, `training.{per_device_train_batch_size,early_stopping_patience,num_train_epochs,lr}`
+- **GPU memory limit**: 24GB GPU — hidden sizes [768, 384] fit, [1024, 512] OOM; 3+ layers with [512, 256, 128] fit, [768, 384, 192] OOM
+- **Best known config**: 2-layer [768, 384], dropout=0, LR=1e-4, BS=4 → Val R2 ≈ -0.0103
+- **Long epoch pattern**: `Dataset.__len__` returns `actual_dates * repeat`; train uses `repeat=1000`, val uses `repeat=1`
+- **Dataset split**: train dates 0-299, val dates 300-359
+- **Validation**: R2 score computed at each eval step on val set
+- **Steps-based eval/save**: `eval_strategy='steps'`, `eval_steps=100`, `save_strategy='steps'`, `save_steps=100`
+- **Early stopping**: HuggingFace `EarlyStoppingCallback` with `patience` on val R2 (`metric_for_best_model='eval_r2'`, `load_best_model_at_end=True`)
+- **HuggingFace constraint**: `load_best_model_at_end=True` requires `save_strategy == eval_strategy`
+- **Fast experiment mode**: `early_stopping_patience=1` for quick LR/parameter sweeps
+- **Dataset**: `LingjunTrainSet` loads parquet with cross-sectional zscore normalization; `__getitem__` returns `data[index % len]` to cycle dates; `repeat` param controls dataset length multiplier
+
+### ModelR `use_aux_targets` (CRITICAL)
+
+- **`ModelR` has `use_aux_targets=False` by default**: No auxiliary heads; loss is only LabelA R2
+- **When `True`**: Creates aux heads for LabelB/LabelC, adds their R2 losses to total loss
+- **All model instantiation sites** pass `getattr(cfg, 'use_aux_targets', False)` — default OFF
+
+### HF Trainer Integration (CRITICAL)
+
+- **Model forward must return dict**: `return {"loss": loss, "logits": main_pred}` — returning a tuple `(loss,)` causes HF Trainer to extract empty logits via `outputs[1:]`, skipping `compute_metrics`
+- **`compute_metrics` shapes**: `predictions` is `(N, T)`, `labels` is `(N, T, 3)` for [LabelA, LabelB, LabelC]. Must extract LabelA first:
+  ```python
+  predictions = predictions.reshape(-1)
+  labels = labels[:, :, 0].reshape(-1)  # LabelA
+  return {'r2': r2_score(labels, predictions)}
+  ```
+
+## Jupyter MCP (CRITICAL)
+
+**Jupyter server 的 `base_url` 是 `/jupyter/`，MCP 默认连接 `http://localhost:8888` 会 404。**
+每次新会话需要使用 Jupyter MCP 时，必须先执行以下连接命令：
 
 ```python
-# Shape: (n_stocks, n_times, n_features) → (batch, time, feature)
-X = X.reshape(T, -1, K).swapaxes(0, 1)  # For batch-first RNN
+mcp__jupyter__connect_to_jupyter(
+    jupyter_url="http://localhost:8888/jupyter",
+    jupyter_token="jupyter-autodl-container-ab4341a2e0-0e2de444-e6581ff7706eb44528af95f4101762a354bf3c84b6feb43fd942bb72f29536103"
+)
 ```
 
-**Weighted R²:**
+**禁止使用 `http://localhost:8888`（缺少 `/jupyter/` 前缀），否则会返回 404 错误。**
+**注意 URL 末尾不要带斜杠**，否则会出现 `//` 双斜杠错误。
 
-```python
-# 标准 R² 公式: R² = 1 - SS_res / SS_tot
-y_mean = sum(w * y_true) / sum(w)
-ss_res = sum(w * (pred - true) ** 2)
-ss_tot = sum(w * (true - y_mean) ** 2)
-r2 = 1 - ss_res / (ss_tot + 1e-38)
-```
+已安装 `jupyter-collaboration`（v4.3.0），使 MCP 的 `execute_cell`/`read_cell` 等 notebook 操作正常工作。
 
-**Online learning validation (CRITICAL):**
-
-```python
-# When doing online learning during validation, MUST copy the model first
-# to avoid modifying the training model (follows Jane Street pattern)
-import copy
-if online_lr is not None:
-    model_val = copy.deepcopy(model)
-    # Run validation/updates on model_val, not model
-```
+可用工具：`connect_to_jupyter`, `use_notebook`, `execute_code`, `execute_cell`, `insert_cell`, `edit_cell_source`, `read_cell`, `list_notebooks`, `read_notebook`, `list_files`。
 
 ## Bash Command Style
 
-- Put comments/explanations AFTER the command, not inside quoted strings
-- Avoid `#` inside `-c "..."` Python strings - explain in response text instead
-- This prevents permission approval prompts
-
----
-
-## Hyperparameter Tuning Progress
-
-Experiments logged in `experiments/experiment_log.csv`. Checkpoint naming: `exp_{id:03d}.pt`.
-
-### Completed Experiments (exp_001 - exp_013)
-
-Using `data/filtered.parquet` (exchangeid=0 subset):
-
-| ID | hidden_sizes | dropout | LR | BS | Best Val R² | Epoch | Notes |
-|----|--------------|---------|-----|-----|-------------|-------|-------|
-| 1 | [500] | 0.3 | 0.0005 | 16 | -0.0167 | 10 | Baseline |
-| 4 | [500] | 0.3 | 0.0001 | 16 | +0.0047 | 37 | First positive R² |
-| 8 | [500] | 0.3 | 0.0001 | 4 | +0.0032 | 36 | BS=4 baseline |
-| 9 | [256] | 0.3 | 0.0001 | 4 | +0.0030 | 19 | Smaller capacity |
-| 10 | [768] | 0.3 | 0.0001 | 4 | -0.0087 | 9 | Larger → overfit |
-| 11 | [512, 256] | 0.3 | 0.0001 | 4 | **+0.0102** | 57 | **Best!** |
-| 12 | [512, 256] | 0.1 | 0.0001 | 4 | **+0.0102** | 37 | Same good |
-
-### Completed Experiments (exp_016+)
-
-Using `data/train.parquet` (full dataset, 500 stocks):
-
-| ID | Features | BS | Best Val R² | Epoch | Notes |
-|----|----------|-----|-------------|-------|-------|
-| 16 | 50 | 1 | +0.0077 | 54 | Memory-optimized config |
-
-### Planned Experiments (exp_014 - exp_019)
-
-Using `data/train.parquet` (full dataset, 500 stocks), with online learning enabled:
-
-| ID | Config File | Model | hidden_sizes | Description |
-|----|-------------|-------|--------------|-------------|
-| 14 | config_exp_014.yaml | GRU | [512, 256] | patience=15 (filtered) |
-| 15 | config_exp_014.yaml | GRU | [512, 256] | full dataset, BS=1 (in progress) |
-| 16 | config_exp_016.yaml | GRU | [512, 256, 128] | 3层递减 |
-| 17 | config_exp_017.yaml | GRU | [512, 512, 512] | 3层非递减 |
-| 18 | config_exp_018.yaml | GRU | [768, 384, 192] | 3层增大+递减 |
-| 19 | config_exp_019.yaml | LSTM | [512, 256] | 对比GRU |
-
-Run command:
-```bash
-python run_training_simple.py config/config_exp_014.yaml
-```
-
-### Key Findings
-
-1. **Feature count**: 80 features (129 total with rolling stats) is optimal. More features = more noise.
-
-2. **Learning rate**: **lr=0.0001** is optimal. Higher LR (0.0003-0.002) all negative R².
-
-3. **Model capacity**: **Two-layer GRU [512, 256]** outperforms single-layer.
-   - Single [768] overfits quickly, single [256] underfits
-   - Two-layer allows deeper representation without overfitting
-
-4. **Dropout**: **0.1-0.3** works well, **0.5 too aggressive**.
-
-5. **Online learning**: AdamW (lr=0.0003, weight_decay=0.01) + grad clipping (max_norm=1.0) per batch.
-
-### Current Best Configuration
-
-```yaml
-model:
-  type: gru
-  hidden_sizes: [512, 256]
-  dropout_rates: [0.1, 0.1, 0.0]
-  hidden_sizes_linear: [500, 300]
-  dropout_rates_linear: [0.2, 0.1]
-
-training:
-  batch_size: 4
-  lr: 0.0001
-  lr_online: 0.00006
-  online_learning: true
-  early_stopping_patience: 10
-
-features:
-  cols_init: Top 80 features by importance
-```
+- Put comments AFTER the command, not inside quoted strings
+- Avoid `#` inside `-c "..."` Python strings - explain in response text
+- **禁止使用 `tail -N`、`head -N`、`grep --color` 等截断或过滤命令的输出** — 用户需要看到命令的完整输出信息，不要自行截断
+- 运行 Python 脚本优先用 `.venv/bin/python script.py`，而非 `source .venv/bin/activate && python script.py`（后者在后台任务中容易丢失激活状态）
